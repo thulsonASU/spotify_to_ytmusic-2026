@@ -1,5 +1,7 @@
 import time
+import json
 from datetime import datetime
+from pathlib import Path
 
 import spotipy
 
@@ -7,6 +9,12 @@ from spotify_to_ytmusic.setup import setup as setup_func
 from spotify_to_ytmusic.spotify import Spotify
 from spotify_to_ytmusic.ytmusic import YTMusicTransfer
 
+CACHE_FILE = Path("~/.cache/spotify_to_ytmusic/yt_cache.json").expanduser()
+CYAN = '\033[0;36m'
+YELLOW = '\033[1;33m'
+GREEN = '\033[0;32m'
+RED = '\033[0;31m'
+NC = '\033[0m'
 
 def _get_spotify_playlist(spotify, playlist):
     try:
@@ -33,28 +41,60 @@ def _init():
 def all(args):
     spotify, ytmusic = _init()
     pl = spotify.getUserPlaylists(args.user)
-    print(str(len(pl)) + " playlists found. Starting transfer...")
-    count = 1
+
+    # 1. Skip logic (already discussed)
+    yt_library = ytmusic.api.get_library_playlists(limit=None)
+    existing_yt_names = {p['title'].lower() for p in yt_library}
+
     for p in pl:
-        print("Playlist " + str(count) + ": " + p["name"])
-        count = count + 1
-        try:
-            playlist = spotify.getSpotifyPlaylist(p["external_urls"]["spotify"])
-            videoIds = ytmusic.search_songs(
-                playlist["tracks"], use_cached=args.use_cached
-            )
-            playlist_id = ytmusic.create_playlist(
-                p["name"],
-                p["description"],
-                "PUBLIC" if p["public"] else "PRIVATE",
-                videoIds,
-            )
-            if args.like:
-                for id in videoIds:
-                    ytmusic.rate_song(id, "LIKE")
-            _print_success(p["name"], playlist_id)
-        except Exception as ex:
-            print(f"Could not transfer playlist {p['name']}. {ex!s}")
+        p_name = p["name"]
+        if p_name.lower() in existing_yt_names:
+            print(f"Skipping {p_name} (Exists)")
+            continue
+
+        print(f"\n--- Processing: {p_name} ---")
+        spotify_data = spotify.getSpotifyPlaylist(p["external_urls"]["spotify"])
+
+        # 2. FUZZY CACHE SEARCH
+        final_video_ids = []
+        tracks_to_search = []
+
+        for track in spotify_data["tracks"]:
+            cached_id = get_cached_id(track["name"], track["artist"])
+            if cached_id:
+                final_video_ids.append(cached_id)
+            else:
+                tracks_to_search.append(track)
+
+        # 3. SEARCH ONLY WHAT WE DON'T KNOW
+        if tracks_to_search:
+            print(f"  Searching for {len(tracks_to_search)} new tracks...")
+            new_ids = ytmusic.search_songs(tracks_to_search, use_cached=args.use_cached)
+
+            # Save new results to cache
+            for i, track in enumerate(tracks_to_search):
+                if i < len(new_ids):
+                    set_cached_id(track["name"], track["artist"], new_ids[i])
+
+            final_video_ids.extend(new_ids)
+
+        # 4. SMART CHUNKING: Create and Fill
+        # Create empty playlist
+        playlist_id = ytmusic.api.create_playlist(
+            p_name,
+            p["description"],
+            privacy_status="PUBLIC" if p["public"] else "PRIVATE"
+        )
+
+        # Add in batches of 25 to stay under the radar
+        batch_size = 25
+        for i in range(0, len(final_video_ids), batch_size):
+            batch = final_video_ids[i : i + batch_size]
+            ytmusic.api.add_playlist_items(playlist_id, batch)
+            print(f"  Added tracks {i} to {i+len(batch)}...")
+            time.sleep(1.5) # The "I'm a human" pause
+
+        print(f"Successfully synced: {p_name}")
 
 
 def _create_ytmusic(args, playlist, ytmusic):
@@ -131,3 +171,26 @@ def cache_clear(args):
 
 def setup(args):
     setup_func(args.file)
+
+def get_cached_id(spotify_track_name, artist):
+    if not CACHE_FILE.exists():
+        return None
+    with open(CACHE_FILE, "r") as f:
+        cache = json.load(f)
+    # Keying by "Artist - Title" for a simple fuzzy match
+    search_key = f"{artist} - {spotify_track_name}".lower()
+    return cache.get(search_key)
+
+def set_cached_id(spotify_track_name, artist, yt_id):
+    cache = {}
+    if CACHE_FILE.exists():
+        with open(CACHE_FILE, "r") as f:
+            cache = json.load(f)
+
+    search_key = f"{artist} - {spotify_track_name}".lower()
+    cache[search_key] = yt_id
+
+    # Create directory if missing
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=4)
